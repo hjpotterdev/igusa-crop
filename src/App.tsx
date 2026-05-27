@@ -104,10 +104,10 @@ export default function App() {
   // 인라인 토스트 알림 시스템 (alert() 대체 - 비차단 UX)
   const [toasts, setToasts] = useState<Toast[]>([]);
 
-  // 여백 감지 모드 상태 (투명 배경 vs 흰색 배경 감지)
-  const [bgDetectionMode, setBgDetectionMode] = useState<'transparent' | 'white'>('transparent');
-  // 흰색 감지 허용 오차 (0: 완벽한 흰색만, 100: 약간 회색빛까지 감지)
-  const [bgTolerance, setBgTolerance] = useState<number>(20);
+  // 여백 감지 모드: 'auto'=코너 샘플링 자동 감지(기본), 'transparent'=투명도 감지, 'white'=흰색 고정 감지
+  const [bgDetectionMode, setBgDetectionMode] = useState<'auto' | 'transparent' | 'white'>('auto');
+  // 배경색 허용 오차 (색상 거리 기준, 낮을수록 엄격 / 기본 30은 대부분 단색 배경에 적합)
+  const [bgTolerance, setBgTolerance] = useState<number>(30);
   // 고급 수동 설정 (여백 오차율 및 수동 패딩 조절) 펼침 여부 상태 (기본: 접힘)
   const [showAdvancedSettings, setShowAdvancedSettings] = useState<boolean>(false);
 
@@ -168,17 +168,108 @@ export default function App() {
   }, [isDarkMode]);
 
   // ==========================================
-  // 4. 핵심 알고리즘: 투명/흰색 여백 감지 및 크랍 처리
+  // 4. 핵심 알고리즘: 배경 자동 감지 및 크랍 처리
   // ==========================================
-  
-  // 픽셀 레벨 투명 또는 흰색 바운딩 박스 연산 수행
+
+  /**
+   * 이미지 4개 모서리에서 배경색을 자동 샘플링하는 함수.
+   * 모서리 픽셀들의 평균 RGB를 배경색으로 사용.
+   * 투명 영역(alpha=0)이 많으면 투명 모드가 더 적합함을 함께 반환.
+   */
+  const sampleBackgroundColor = (
+    data: Uint8ClampedArray,
+    width: number,
+    height: number
+  ): { r: number; g: number; b: number; isTransparentBg: boolean } => {
+    // 모서리 4곳 + 각 모서리 인근 몇 픽셀씩 샘플링
+    const samplePoints = [
+      [0, 0], [1, 0], [0, 1], [1, 1],                          // 좌상단
+      [width - 1, 0], [width - 2, 0], [width - 1, 1],          // 우상단
+      [0, height - 1], [0, height - 2], [1, height - 1],        // 좌하단
+      [width - 1, height - 1], [width - 2, height - 1],         // 우하단
+    ];
+
+    let totalR = 0, totalG = 0, totalB = 0;
+    let transparentCount = 0;
+    let validCount = 0;
+
+    for (const [sx, sy] of samplePoints) {
+      const idx = (sy * width + sx) * 4;
+      const alpha = data[idx + 3];
+      if (alpha < 10) {
+        transparentCount++;
+      } else {
+        totalR += data[idx];
+        totalG += data[idx + 1];
+        totalB += data[idx + 2];
+        validCount++;
+      }
+    }
+
+    // 모서리의 절반 이상이 투명이면 투명 배경 이미지
+    const isTransparentBg = transparentCount > samplePoints.length / 2;
+
+    if (validCount === 0) {
+      return { r: 255, g: 255, b: 255, isTransparentBg: true };
+    }
+
+    return {
+      r: Math.round(totalR / validCount),
+      g: Math.round(totalG / validCount),
+      b: Math.round(totalB / validCount),
+      isTransparentBg,
+    };
+  };
+
+  /**
+   * 두 RGB 색상 간의 유클리드 거리 계산.
+   * 값이 낮을수록 비슷한 색상.
+   */
+  const colorDistance = (r1: number, g1: number, b1: number, r2: number, g2: number, b2: number): number => {
+    return Math.sqrt(
+      (r1 - r2) ** 2 +
+      (g1 - g2) ** 2 +
+      (b1 - b2) ** 2
+    );
+  };
+
+  /**
+   * 이미지에서 오브젝트의 바운딩 박스를 감지하는 함수.
+   * - 'auto' 모드: 모서리 색상을 샘플링해 배경색 자동 판별 (크림색, 흰색, 회색 등 모든 단색 배경 지원)
+   * - 'transparent' 모드: 알파 채널 기반 투명 픽셀만 배경으로 처리
+   * - 'white' 모드: 흰색 계열 고정 감지
+   */
   const getOpaqueBoundingBox = (
     imageData: ImageData,
-    mode: 'transparent' | 'white',
+    mode: 'auto' | 'transparent' | 'white',
     tolerance: number
   ): { top: number; bottom: number; left: number; right: number; width: number; height: number } | null => {
     const { data, width, height } = imageData;
     let top = height, bottom = -1, left = width, right = -1;
+
+    // auto 모드: 모서리 샘플링으로 배경색 자동 감지
+    let bgR = 255, bgG = 255, bgB = 255;
+    let useColorDistance = false;
+
+    if (mode === 'auto') {
+      const sampled = sampleBackgroundColor(data, width, height);
+      if (sampled.isTransparentBg) {
+        // 투명 배경 이미지면 투명도 기반으로 처리
+        useColorDistance = false;
+      } else {
+        // 단색 배경이면 샘플링된 배경색과 색상 거리로 비교
+        bgR = sampled.r;
+        bgG = sampled.g;
+        bgB = sampled.b;
+        useColorDistance = true;
+      }
+    } else if (mode === 'white') {
+      bgR = 255; bgG = 255; bgB = 255;
+      useColorDistance = true;
+    }
+
+    // tolerance를 색상 거리(0~441 범위)로 변환 (슬라이더 0~100 -> 실제 거리 0~80)
+    const distanceThreshold = tolerance * 0.8;
 
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
@@ -187,18 +278,23 @@ export default function App() {
         const g = data[index + 1];
         const b = data[index + 2];
         const alpha = data[index + 3];
-        
+
         let isTarget = false;
+
         if (mode === 'transparent') {
-          // 투명도가 있는 영역을 제외한 모든 유효 픽셀 감지
+          // 투명도 기반 감지: alpha > 0 인 픽셀이 오브젝트
           isTarget = alpha > 0;
+        } else if (useColorDistance) {
+          // 색상 거리 기반 감지: 배경색과 충분히 다른 픽셀이 오브젝트
+          if (alpha < 10) {
+            isTarget = false; // 완전 투명은 제외
+          } else {
+            const dist = colorDistance(r, g, b, bgR, bgG, bgB);
+            isTarget = dist > distanceThreshold;
+          }
         } else {
-          // 흰색 배경 감지 모드:
-          // 알파가 투명도 한계점보다 크면서, RGB 값이 지정된 오차 임계값 기준 흰색보다 어두운 경우만 '실제 콘텐츠 영역'으로 인식
-          const limit = 255 - tolerance;
-          const isWhite = r >= limit && g >= limit && b >= limit;
-          // 투명도도 높고 흰색이 아니어야 실제 개체로 판정
-          isTarget = alpha > 10 && !isWhite;
+          // auto이지만 투명 배경으로 감지된 경우
+          isTarget = alpha > 0;
         }
 
         if (isTarget) {
@@ -210,7 +306,6 @@ export default function App() {
       }
     }
 
-    // 만약 감지된 내용물 픽셀이 하나도 없다면 null 리턴
     if (bottom === -1 || right === -1) {
       return null;
     }
@@ -229,7 +324,7 @@ export default function App() {
   const processImageCrop = useCallback((
     item: ImageItem, 
     currentPadding: typeof item.padding,
-    mode: 'transparent' | 'white' = bgDetectionMode,
+    mode: 'auto' | 'transparent' | 'white' = bgDetectionMode,
     tolerance: number = bgTolerance
   ): Promise<ImageItem> => {
     return new Promise((resolve) => {
@@ -622,7 +717,7 @@ export default function App() {
 
   // 감지 옵션(모드, 허용오차) 변경 시 실시간으로 현재 선택된 이미지 재연산
   const applyDetectionSettingsLive = useCallback(async (
-    mode: 'transparent' | 'white',
+    mode: 'auto' | 'transparent' | 'white',
     tolerance: number
   ) => {
     if (!selectedImageId) return;
@@ -1003,10 +1098,10 @@ export default function App() {
                   <>
                     <p className="font-semibold text-sm">PNG 파일을 드래그 & 드롭하거나 클릭하여 업로드</p>
                     <p className="text-xs text-primary dark:text-blue-400 font-bold mt-1.5">
-                      ⚡ 업로드 즉시 사방 5px 여백이 자동 적용되어 완벽한 정중앙 크롭이 완료됩니다!
+                      ⚡ 업로드 즉시 배경색을 자동 감지하여 오브젝트만 타이트하게 크롭합니다!
                     </p>
                     <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-1">
-                      최대 50장 • 장당 20MB 이하 • 투명/흰색 배경 PNG 전용
+                      최대 50장 • 장당 20MB 이하 • 흰색/크림/단색 배경 PNG 전용
                     </p>
                   </>
                 )}
@@ -1336,31 +1431,47 @@ export default function App() {
                       <div className="flex flex-col gap-1.5">
                         <label className="text-[10px] font-bold text-slate-400">감지 모드 선택</label>
                         <div className="flex items-center bg-slate-200/50 dark:bg-slate-800 p-0.5 rounded-xl text-xs font-semibold">
+                          {/* 자동 감지 (모서리 샘플링) - 기본값, 대부분의 화이트/크림 배경에서 완벽 동작 */}
+                          <button
+                            onClick={() => {
+                              setBgDetectionMode('auto');
+                              applyDetectionSettingsLive('auto', bgTolerance);
+                            }}
+                            className={`flex-1 py-1.5 text-center rounded-lg transition-all text-[10px] ${
+                              bgDetectionMode === 'auto'
+                                ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
+                                : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
+                            }`}
+                          >
+                            화이트/크림 자동
+                          </button>
+                          {/* 투명 배경 PNG 전용 */}
                           <button
                             onClick={() => {
                               setBgDetectionMode('transparent');
                               applyDetectionSettingsLive('transparent', bgTolerance);
                             }}
-                            className={`flex-1 py-1.5 text-center rounded-lg transition-all text-[11px] ${
+                            className={`flex-1 py-1.5 text-center rounded-lg transition-all text-[10px] ${
                               bgDetectionMode === 'transparent'
                                 ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
                                 : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
                             }`}
                           >
-                            투명 배경 감지
+                            투명 배경
                           </button>
+                          {/* 흰색 고정 */}
                           <button
                             onClick={() => {
                               setBgDetectionMode('white');
                               applyDetectionSettingsLive('white', bgTolerance);
                             }}
-                            className={`flex-1 py-1.5 text-center rounded-lg transition-all text-[11px] ${
+                            className={`flex-1 py-1.5 text-center rounded-lg transition-all text-[10px] ${
                               bgDetectionMode === 'white'
                                 ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
                                 : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
                             }`}
                           >
-                            흰색 배경 제거
+                            흰색 고정
                           </button>
                         </div>
                       </div>
@@ -1374,7 +1485,7 @@ export default function App() {
                             type="range"
                             min="0"
                             max="100"
-                            disabled={bgDetectionMode !== 'white'}
+                            disabled={bgDetectionMode === 'transparent'}
                             value={bgTolerance}
                             onChange={(e) => {
                               const val = parseInt(e.target.value);
