@@ -77,10 +77,10 @@ export default function App() {
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [isDarkMode, setIsDarkMode] = useState<boolean>(true); // 기본 다크모드 적용 (프리미엄 룩)
   
-  // 패딩 제어 변수 (일괄 변경 or 개별 변경용 임시 상태)
-  const [paddingAll, setPaddingAll] = useState<number>(0);
+  // 패딩 제어 변수 (일괄 변경 or 개별 변경용 임시 상태 - 기본 사방 5px 자동 여백 정리)
+  const [paddingAll, setPaddingAll] = useState<number>(5);
   const [paddingIndividual, setPaddingIndividual] = useState<{ top: number; bottom: number; left: number; right: number }>({
-    top: 0, bottom: 0, left: 0, right: 0
+    top: 5, bottom: 5, left: 5, right: 5
   });
   const [useIndividualPadding, setUseIndividualPadding] = useState<boolean>(false);
 
@@ -108,6 +108,8 @@ export default function App() {
   const [bgDetectionMode, setBgDetectionMode] = useState<'transparent' | 'white'>('transparent');
   // 흰색 감지 허용 오차 (0: 완벽한 흰색만, 100: 약간 회색빛까지 감지)
   const [bgTolerance, setBgTolerance] = useState<number>(20);
+  // 고급 수동 설정 (여백 오차율 및 수동 패딩 조절) 펼침 여부 상태 (기본: 접힘)
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState<boolean>(false);
 
   // DOM Refs
   const logContainerRef = useRef<HTMLDivElement>(null);
@@ -152,7 +154,7 @@ export default function App() {
 
   // 첫 마운트 시 웰컴 로그
   useEffect(() => {
-    addLog("시스템 준비 완료. 크랍을 원하는 PNG 파일을 업로드해 주세요.", "info");
+    addLog("시스템 준비 완료. PNG 이미지를 업로드하면 즉시 사방 5px 여백 정리가 자동으로 실행됩니다.", "info");
   }, [addLog]);
 
   // 최상위 HTML 엘리먼트 다크모드 클래스 바인딩
@@ -407,7 +409,7 @@ export default function App() {
         croppedWidth: null,
         croppedHeight: null,
         cropBox: null,
-        padding: useIndividualPadding ? { ...paddingIndividual } : { top: paddingAll, bottom: paddingAll, left: paddingAll, right: paddingAll },
+        padding: { top: 5, bottom: 5, left: 5, right: 5 }, // 사방 5px 안전 여백 기본 적용
         status: 'idle',
         errorMessage: null,
         noMargin: false,
@@ -445,8 +447,15 @@ export default function App() {
     });
 
     Promise.all(loadDimensionsPromises).then(finalItems => {
+      // 1단계: 업로드 즉시 각 이미지를 'processing'(분석 중) 상태로 표시하여 화면 스피너 우선 노출
+      const processingItems = finalItems.map(item => ({
+        ...item,
+        status: 'processing' as const,
+        padding: { top: paddingAll, bottom: paddingAll, left: paddingAll, right: paddingAll }
+      }));
+
       setImages(prev => {
-        const updated = [...prev, ...finalItems];
+        const updated = [...prev, ...processingItems];
         // 업로드 후 첫 이미지가 있으면 바로 선택되게 활성화
         if (updated.length > 0 && !selectedImageId) {
           setSelectedImageId(updated[0].id);
@@ -455,8 +464,37 @@ export default function App() {
       });
 
       finalItems.forEach(item => {
-        addLog(`"${item.name}" 업로드 완료 (${item.width}x${item.height} px, ${(item.size / (1024 * 1024)).toFixed(2)} MB)`, "info");
+        addLog(`"${item.name}" 업로드 완료 (${item.width}x${item.height} px)`, "info");
       });
+
+      // 2단계: 각각의 이미지를 비동기로 백그라운드 크롭 분석 처리 즉시 실행 (핵심 개선 A & B)
+      processingItems.forEach(item => {
+        const defaultPadding = { top: paddingAll, bottom: paddingAll, left: paddingAll, right: paddingAll };
+        processImageCrop(item, defaultPadding).then(processed => {
+          setImages(current => {
+            const idx = current.findIndex(img => img.id === item.id);
+            if (idx === -1) return current;
+            const clone = [...current];
+            clone[idx] = processed;
+            return clone;
+          });
+
+          // 자동 크롭 완료 실시간 알림 로그
+          if (processed.status === 'done') {
+            addLog(
+              `"${processed.name}" 자동 여백 정리 성공: ` +
+              `${processed.width}x${processed.height} px → ${processed.croppedWidth}x${processed.croppedHeight} px ` +
+              `(사방 ${paddingAll}px 안전 여백 자동 추가 완료)`,
+              "success"
+            );
+          } else {
+            addLog(`"${processed.name}" 자동 여백 크롭 실패: ${processed.errorMessage}`, "error");
+          }
+        });
+      });
+
+      // 완료 후 결과물을 즉시 볼 수 있게 '작업 후 보기' 프리뷰 모드로 자동 변경
+      setViewMode('after');
     });
   };
 
@@ -964,8 +1002,11 @@ export default function App() {
                   // 기본 안내 메시지
                   <>
                     <p className="font-semibold text-sm">PNG 파일을 드래그 & 드롭하거나 클릭하여 업로드</p>
-                    <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">
-                      최대 50장 • 장당 20MB 이하 • 투명 배경 PNG만 지원
+                    <p className="text-xs text-primary dark:text-blue-400 font-bold mt-1.5">
+                      ⚡ 업로드 즉시 사방 5px 여백이 자동 적용되어 완벽한 정중앙 크롭이 완료됩니다!
+                    </p>
+                    <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-1">
+                      최대 50장 • 장당 20MB 이하 • 투명/흰색 배경 PNG 전용
                     </p>
                   </>
                 )}
@@ -1075,10 +1116,10 @@ export default function App() {
                 <button
                   onClick={runCropAnalysis}
                   disabled={globalProcessing}
-                  className="flex-1 bg-primary text-white hover:bg-primary-hover disabled:opacity-50 font-bold text-sm py-2.5 px-4 rounded-xl flex items-center justify-center gap-2 shadow-lg shadow-primary/20 transition-all hover:scale-[1.02]"
+                  className="flex-1 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-350 hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-50 font-bold text-xs py-2.5 px-4 rounded-xl flex items-center justify-center gap-2 transition-all hover:scale-[1.01]"
                 >
-                  <RefreshCw className={`w-4 h-4 ${globalProcessing ? 'animate-spin' : ''}`} />
-                  크랍 테스트
+                  <RefreshCw className={`w-3.5 h-3.5 ${globalProcessing ? 'animate-spin' : ''}`} />
+                  여백 일괄 재계산 (동기화)
                 </button>
               </div>
             )}
@@ -1260,218 +1301,213 @@ export default function App() {
             )}
           </div>
 
-          {/* 4.5. 신규 추가: 여백 감지 분석 옵션 (투명 vs 흰색 배경 및 허용 오차 조절) */}
+          {/* F-10 & F-11 통합: 상세 수동 미세조정 전문가용 접이식 아코디언 (핵심 개선 C) */}
           {currentImage && (
             <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-5 flex flex-col gap-4">
-              <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-2">
-                <h3 className="font-bold text-sm flex items-center gap-2 text-slate-700 dark:text-slate-200">
-                  <Sparkles className="w-4 h-4 text-primary" />
-                  여백 감지 분석 옵션 (흰색 배경 제거)
-                </h3>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
-                {/* 감지 모드 선택 토글 */}
-                <div className="flex flex-col gap-2">
-                  <label className="text-xs font-bold text-slate-500 dark:text-slate-400">여백 감지 기준 설정</label>
-                  <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-xl text-xs font-semibold">
-                    <button
-                      onClick={() => {
-                        setBgDetectionMode('transparent');
-                        applyDetectionSettingsLive('transparent', bgTolerance);
-                        addLog("여백 감지 모드가 [투명 배경 감지]로 설정되었습니다.", "info");
-                      }}
-                      className={`flex-1 py-2 text-center rounded-lg transition-all ${
-                        bgDetectionMode === 'transparent'
-                          ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
-                          : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
-                      }`}
-                    >
-                      투명 배경 감지 (기본)
-                    </button>
-                    <button
-                      onClick={() => {
-                        setBgDetectionMode('white');
-                        applyDetectionSettingsLive('white', bgTolerance);
-                        addLog("여백 감지 모드가 [흰색 배경 감지]로 설정되었습니다.", "info");
-                      }}
-                      className={`flex-1 py-2 text-center rounded-lg transition-all ${
-                        bgDetectionMode === 'white'
-                          ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
-                          : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
-                      }`}
-                    >
-                      흰색 배경 감지 및 크롭
-                    </button>
-                  </div>
-                </div>
-
-                {/* 흰색 배경 오차 허용 범위 (흰색 모드일때만 활성) */}
-                <div className="flex flex-col gap-2 transition-opacity">
-                  <div className="flex items-center justify-between">
-                    <label className="text-xs font-bold text-slate-500 dark:text-slate-400 flex items-center gap-1">
-                      감지 허용 오차 (밝기 민감도)
-                      <span className="text-[10px] text-slate-400 font-medium">(0 ~ 100)</span>
-                    </label>
-                    <span className="text-xs font-bold text-primary">{bgTolerance}</span>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      disabled={bgDetectionMode !== 'white'}
-                      value={bgTolerance}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value);
-                        setBgTolerance(val);
-                        applyDetectionSettingsLive(bgDetectionMode, val);
-                      }}
-                      className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg disabled:opacity-30 disabled:cursor-not-allowed"
-                    />
-                    <span className="text-xs font-bold text-slate-400 dark:text-slate-500 w-8 text-right">
-                      {bgTolerance}%
-                    </span>
-                  </div>
-                </div>
-              </div>
-              <p className="text-[10px] text-slate-400 dark:text-slate-500 leading-normal">
-                {bgDetectionMode === 'white' 
-                  ? '※ 흰색 배경 모드: 순수 투명색 뿐만 아니라 흰색에 가까운 픽셀(밝은 배경 및 미세 여백)을 감지해 자동 크롭합니다. 오차 값을 높이면 조금 더 어두운 연한 회색/그림자 영역까지 여백으로 간주해 잘라냅니다.'
-                  : '※ 투명 배경 모드: 일반 투명 PNG 요소 업로드 시 픽셀 투명도가 조금이라도 있는 개체의 경계를 완벽히 검출합니다.'
-                }
-              </p>
-            </div>
-          )}
-
-          {/* F-10: 여백 패딩 수동 조절 (Padding Customization Controls) */}
-          {currentImage && (
-            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-5 flex flex-col gap-4">
-              <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-2">
+              <button
+                onClick={() => setShowAdvancedSettings(!showAdvancedSettings)}
+                className="flex items-center justify-between w-full text-left focus:outline-hidden"
+              >
                 <h3 className="font-bold text-sm flex items-center gap-2 text-slate-700 dark:text-slate-200">
                   <Sliders className="w-4 h-4 text-primary" />
-                  크랍 여백 상세 피팅 및 이너 크롭 (P2)
+                  상세 수동 미세조정 (전문가용 옵션)
                 </h3>
-                
-                {/* 일괄 / 개별 모드 변경 토글 */}
-                <div className="flex items-center gap-1.5 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg text-xs">
-                  <button
-                    onClick={() => {
-                      setUseIndividualPadding(false);
-                      // 현재 일괄값으로 슬라이더 동기화
-                      const paddingObj = { top: paddingAll, bottom: paddingAll, left: paddingAll, right: paddingAll };
-                      applyPaddingLive(currentImage.id, paddingObj);
-                    }}
-                    className={`px-3 py-1 rounded-md transition-all ${
-                      !useIndividualPadding 
-                        ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold' 
-                        : 'text-slate-500'
-                    }`}
-                  >
-                    상하좌우 일괄
-                  </button>
-                  <button
-                    onClick={() => {
-                      setUseIndividualPadding(true);
-                      applyPaddingLive(currentImage.id, paddingIndividual);
-                    }}
-                    className={`px-3 py-1 rounded-md transition-all ${
-                      useIndividualPadding 
-                        ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold' 
-                        : 'text-slate-500'
-                    }`}
-                  >
-                    상하좌우 개별
-                  </button>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] bg-slate-100 dark:bg-slate-800 text-slate-500 px-2 py-0.5 rounded-full font-semibold">
+                    {showAdvancedSettings ? "접기" : "펼치기 (배경색/패딩 커스텀)"}
+                  </span>
+                  <ChevronRight className={`w-4 h-4 text-slate-400 transition-transform ${showAdvancedSettings ? 'rotate-90' : ''}`} />
                 </div>
-              </div>
+              </button>
 
-              {!useIndividualPadding ? (
-                /* 일괄 조절 슬라이더 - 이너 크롭을 위해 min을 -100으로 설정 */
-                <div className="flex items-center gap-4">
-                  <label className="text-xs font-semibold text-slate-500 w-24 flex-shrink-0">
-                    전체 패딩: {paddingAll}px
-                  </label>
-                  <input
-                    type="range"
-                    min="-100"
-                    max="200"
-                    value={paddingAll}
-                    onChange={(e) => handlePaddingAllChange(parseInt(e.target.value))}
-                    className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg cursor-pointer"
-                  />
-                  <input
-                    type="number"
-                    min="-100"
-                    max="200"
-                    value={paddingAll}
-                    onChange={(e) => handlePaddingAllChange(Math.min(200, Math.max(-100, parseInt(e.target.value) || 0)))}
-                    className="w-16 px-2 py-1 border border-slate-200 dark:border-slate-700 rounded-lg text-xs bg-slate-50 dark:bg-slate-800 text-center"
-                  />
-                </div>
-              ) : (
-                /* 개별 조절 슬라이더 그리드 - 이너 크롭을 위해 min을 -100으로 설정 */
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {/* 상(Top) */}
-                  <div className="flex items-center gap-3">
-                    <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">상단 (Top)</label>
-                    <input
-                      type="range"
-                      min="-100"
-                      max="200"
-                      value={paddingIndividual.top}
-                      onChange={(e) => handleIndividualPaddingChange('top', parseInt(e.target.value))}
-                      className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg"
-                    />
-                    <span className="text-xs text-slate-500 font-bold w-10 text-right">{paddingIndividual.top}px</span>
+              {showAdvancedSettings && (
+                <div className="flex flex-col gap-6 pt-4 border-t border-slate-100 dark:border-slate-800/80 transition-all duration-300">
+                  
+                  {/* 파트 1: 여백 감지 분석 옵션 */}
+                  <div className="flex flex-col gap-4 bg-slate-50 dark:bg-slate-800/40 p-4 rounded-2xl border border-slate-100 dark:border-slate-850">
+                    <div className="flex items-center justify-between pb-1">
+                      <h4 className="text-xs font-extrabold text-slate-600 dark:text-slate-350 flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-primary" />
+                        여백 감지 분석 기준 설정
+                      </h4>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-[10px] font-bold text-slate-400">감지 모드 선택</label>
+                        <div className="flex items-center bg-slate-200/50 dark:bg-slate-800 p-0.5 rounded-xl text-xs font-semibold">
+                          <button
+                            onClick={() => {
+                              setBgDetectionMode('transparent');
+                              applyDetectionSettingsLive('transparent', bgTolerance);
+                            }}
+                            className={`flex-1 py-1.5 text-center rounded-lg transition-all text-[11px] ${
+                              bgDetectionMode === 'transparent'
+                                ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
+                                : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
+                            }`}
+                          >
+                            투명 배경 감지
+                          </button>
+                          <button
+                            onClick={() => {
+                              setBgDetectionMode('white');
+                              applyDetectionSettingsLive('white', bgTolerance);
+                            }}
+                            className={`flex-1 py-1.5 text-center rounded-lg transition-all text-[11px] ${
+                              bgDetectionMode === 'white'
+                                ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
+                                : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
+                            }`}
+                          >
+                            흰색 배경 제거
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex items-center justify-between">
+                          <label className="text-[10px] font-bold text-slate-400">흰색 오차 민감도 ({bgTolerance})</label>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="range"
+                            min="0"
+                            max="100"
+                            disabled={bgDetectionMode !== 'white'}
+                            value={bgTolerance}
+                            onChange={(e) => {
+                              const val = parseInt(e.target.value);
+                              setBgTolerance(val);
+                              applyDetectionSettingsLive(bgDetectionMode, val);
+                            }}
+                            className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg disabled:opacity-35"
+                          />
+                          <span className="text-[10px] font-bold text-slate-400 w-8 text-right">{bgTolerance}%</span>
+                        </div>
+                      </div>
+                    </div>
                   </div>
 
-                  {/* 하(Bottom) */}
-                  <div className="flex items-center gap-3">
-                    <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">하단 (Bottom)</label>
-                    <input
-                      type="range"
-                      min="-100"
-                      max="200"
-                      value={paddingIndividual.bottom}
-                      onChange={(e) => handleIndividualPaddingChange('bottom', parseInt(e.target.value))}
-                      className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg"
-                    />
-                    <span className="text-xs text-slate-500 font-bold w-10 text-right">{paddingIndividual.bottom}px</span>
+                  {/* 파트 2: 수동 미세 패딩 피팅 */}
+                  <div className="flex flex-col gap-4">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-xs font-extrabold text-slate-600 dark:text-slate-350 flex items-center gap-1.5">
+                        <Sliders className="w-3.5 h-3.5 text-primary" />
+                        여백 패딩(픽셀) 상세 미세조정
+                      </h4>
+                      
+                      <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-850 p-0.5 rounded-lg text-[10px]">
+                        <button
+                          onClick={() => {
+                            setUseIndividualPadding(false);
+                            const paddingObj = { top: paddingAll, bottom: paddingAll, left: paddingAll, right: paddingAll };
+                            applyPaddingLive(currentImage.id, paddingObj);
+                          }}
+                          className={`px-2 py-0.5 rounded-md ${
+                            !useIndividualPadding ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold' : 'text-slate-500'
+                          }`}
+                        >
+                          일괄
+                        </button>
+                        <button
+                          onClick={() => {
+                            setUseIndividualPadding(true);
+                            applyPaddingLive(currentImage.id, paddingIndividual);
+                          }}
+                          className={`px-2 py-0.5 rounded-md ${
+                            useIndividualPadding ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold' : 'text-slate-500'
+                          }`}
+                        >
+                          개별
+                        </button>
+                      </div>
+                    </div>
+
+                    {!useIndividualPadding ? (
+                      <div className="flex items-center gap-4 bg-slate-50 dark:bg-slate-800/20 p-3 rounded-xl">
+                        <label className="text-xs font-semibold text-slate-500 w-24 flex-shrink-0">
+                          전체 여백: {paddingAll}px
+                        </label>
+                        <input
+                          type="range"
+                          min="-100"
+                          max="200"
+                          value={paddingAll}
+                          onChange={(e) => handlePaddingAllChange(parseInt(e.target.value))}
+                          className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg cursor-pointer"
+                        />
+                        <input
+                          type="number"
+                          min="-100"
+                          max="200"
+                          value={paddingAll}
+                          onChange={(e) => handlePaddingAllChange(Math.min(200, Math.max(-100, parseInt(e.target.value) || 0)))}
+                          className="w-16 px-2 py-1 border border-slate-200 dark:border-slate-700 rounded-lg text-xs bg-slate-50 dark:bg-slate-800 text-center"
+                        />
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 bg-slate-50 dark:bg-slate-800/20 p-3 rounded-xl">
+                        <div className="flex items-center gap-3">
+                          <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">상단 (Top)</label>
+                          <input
+                            type="range"
+                            min="-100"
+                            max="200"
+                            value={paddingIndividual.top}
+                            onChange={(e) => handleIndividualPaddingChange('top', parseInt(e.target.value))}
+                            className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg"
+                          />
+                          <span className="text-xs text-slate-500 font-bold w-10 text-right">{paddingIndividual.top}px</span>
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                          <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">하단 (Bottom)</label>
+                          <input
+                            type="range"
+                            min="-100"
+                            max="200"
+                            value={paddingIndividual.bottom}
+                            onChange={(e) => handleIndividualPaddingChange('bottom', parseInt(e.target.value))}
+                            className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg"
+                          />
+                          <span className="text-xs text-slate-500 font-bold w-10 text-right">{paddingIndividual.bottom}px</span>
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                          <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">좌측 (Left)</label>
+                          <input
+                            type="range"
+                            min="-100"
+                            max="200"
+                            value={paddingIndividual.left}
+                            onChange={(e) => handleIndividualPaddingChange('left', parseInt(e.target.value))}
+                            className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg"
+                          />
+                          <span className="text-xs text-slate-500 font-bold w-10 text-right">{paddingIndividual.left}px</span>
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                          <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">우측 (Right)</label>
+                          <input
+                            type="range"
+                            min="-100"
+                            max="200"
+                            value={paddingIndividual.right}
+                            onChange={(e) => handleIndividualPaddingChange('right', parseInt(e.target.value))}
+                            className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg"
+                          />
+                          <span className="text-xs text-slate-500 font-bold w-10 text-right">{paddingIndividual.right}px</span>
+                        </div>
+                      </div>
+                    )}
                   </div>
 
-                  {/* 좌(Left) */}
-                  <div className="flex items-center gap-3">
-                    <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">좌측 (Left)</label>
-                    <input
-                      type="range"
-                      min="-100"
-                      max="200"
-                      value={paddingIndividual.left}
-                      onChange={(e) => handleIndividualPaddingChange('left', parseInt(e.target.value))}
-                      className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg"
-                    />
-                    <span className="text-xs text-slate-500 font-bold w-10 text-right">{paddingIndividual.left}px</span>
-                  </div>
-
-                  {/* 우(Right) */}
-                  <div className="flex items-center gap-3">
-                    <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">우측 (Right)</label>
-                    <input
-                      type="range"
-                      min="-100"
-                      max="200"
-                      value={paddingIndividual.right}
-                      onChange={(e) => handleIndividualPaddingChange('right', parseInt(e.target.value))}
-                      className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg"
-                    />
-                    <span className="text-xs text-slate-500 font-bold w-10 text-right">{paddingIndividual.right}px</span>
-                  </div>
+                  <p className="text-[10px] text-slate-400 dark:text-slate-500 leading-relaxed border-t border-slate-100 dark:border-slate-800/80 pt-3">
+                    💡 <strong>꿀팁:</strong> 수동 조절 값을 <strong>음수(-)</strong>로 당기면 요소 경계 안쪽을 깎아내는 <strong>'이너 크롭(Inner Crop)'</strong>이 작동하여 잔여 배경색의 미세한 지저분함을 완전 제거할 수 있습니다.
+                  </p>
                 </div>
               )}
-              <p className="text-[10px] text-slate-400 dark:text-slate-500 leading-normal">
-                ※ 수동 조절 팁: 패딩 값을 <strong>음수(-)</strong>로 설정하면, 감지된 요소의 테두리를 안쪽으로 파고들며 깎아내는 <strong>'이너 크롭(Inner Crop)'</strong>이 작동하여 잔여 배경색의 미세한 흔적을 완벽하게 없앨 수 있습니다.
-              </p>
             </div>
           )}
 
