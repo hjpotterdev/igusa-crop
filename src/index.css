@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  /* 투명 배경 PNG 이미지를 보기 위해 8px 격자형 체크무늬 스타일 제공 */
+  .bg-checkered {
+    background-color: #ffffff;
+    background-image: 
+      linear-gradient(45deg, #e2e8f0 25%, transparent 25%), 
+      linear-gradient(-45deg, #e2e8f0 25%, transparent 25%), 
+      linear-gradient(45deg, transparent 75%, #e2e8f0 75%), 
+      linear-gradient(-45deg, transparent 75%, #e2e8f0 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+  }
+}
