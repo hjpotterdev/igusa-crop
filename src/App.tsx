@@ -104,6 +104,11 @@ export default function App() {
   // 인라인 토스트 알림 시스템 (alert() 대체 - 비차단 UX)
   const [toasts, setToasts] = useState<Toast[]>([]);
 
+  // 여백 감지 모드 상태 (투명 배경 vs 흰색 배경 감지)
+  const [bgDetectionMode, setBgDetectionMode] = useState<'transparent' | 'white'>('transparent');
+  // 흰색 감지 허용 오차 (0: 완벽한 흰색만, 100: 약간 회색빛까지 감지)
+  const [bgTolerance, setBgTolerance] = useState<number>(20);
+
   // DOM Refs
   const logContainerRef = useRef<HTMLDivElement>(null);
   const previewAreaRef = useRef<HTMLDivElement>(null);
@@ -161,23 +166,40 @@ export default function App() {
   }, [isDarkMode]);
 
   // ==========================================
-  // 4. 핵심 알고리즘: 투명 여백 감지 및 크랍 처리
+  // 4. 핵심 알고리즘: 투명/흰색 여백 감지 및 크랍 처리
   // ==========================================
   
-  // 픽셀 레벨 투명 바운딩 박스 연산 수행
-  const getOpaqueBoundingBox = (imageData: ImageData): { top: number; bottom: number; left: number; right: number; width: number; height: number } | null => {
+  // 픽셀 레벨 투명 또는 흰색 바운딩 박스 연산 수행
+  const getOpaqueBoundingBox = (
+    imageData: ImageData,
+    mode: 'transparent' | 'white',
+    tolerance: number
+  ): { top: number; bottom: number; left: number; right: number; width: number; height: number } | null => {
     const { data, width, height } = imageData;
     let top = height, bottom = -1, left = width, right = -1;
 
-    // 왜 4씩 증가시킬까? RGBA 픽셀 데이터 배열은 [R, G, B, A, R, G, B, A ...] 구조이기 때문입니다.
-    // 3번째 인덱스가 Alpha 채널(투명도, 0~255)을 담고 있습니다.
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        const alphaIndex = (y * width + x) * 4 + 3;
-        const alpha = data[alphaIndex];
+        const index = (y * width + x) * 4;
+        const r = data[index];
+        const g = data[index + 1];
+        const b = data[index + 2];
+        const alpha = data[index + 3];
         
-        // 투명도 임계값 기준 (기본: Alpha >= 1 즉, 완전 투명이 아닌 모든 픽셀 감지)
-        if (alpha > 0) {
+        let isTarget = false;
+        if (mode === 'transparent') {
+          // 투명도가 있는 영역을 제외한 모든 유효 픽셀 감지
+          isTarget = alpha > 0;
+        } else {
+          // 흰색 배경 감지 모드:
+          // 알파가 투명도 한계점보다 크면서, RGB 값이 지정된 오차 임계값 기준 흰색보다 어두운 경우만 '실제 콘텐츠 영역'으로 인식
+          const limit = 255 - tolerance;
+          const isWhite = r >= limit && g >= limit && b >= limit;
+          // 투명도도 높고 흰색이 아니어야 실제 개체로 판정
+          isTarget = alpha > 10 && !isWhite;
+        }
+
+        if (isTarget) {
           if (y < top) top = y;
           if (y > bottom) bottom = y;
           if (x < left) left = x;
@@ -186,7 +208,7 @@ export default function App() {
       }
     }
 
-    // 만약 투명하지 않은 픽셀이 하나도 없다면 null 리턴 (전체 투명 에지케이스)
+    // 만약 감지된 내용물 픽셀이 하나도 없다면 null 리턴
     if (bottom === -1 || right === -1) {
       return null;
     }
@@ -201,8 +223,13 @@ export default function App() {
     };
   };
 
-  // 실제로 이미지를 Canvas 상에서 자르고 패딩을 부가하여 결과 Blob URL을 생성하는 함수
-  const processImageCrop = useCallback((item: ImageItem, currentPadding: typeof item.padding): Promise<ImageItem> => {
+  // 실제로 이미지를 Canvas 상에서 자르고 패딩(음수 패딩 포함)을 부가하여 결과 Blob URL을 생성하는 함수
+  const processImageCrop = useCallback((
+    item: ImageItem, 
+    currentPadding: typeof item.padding,
+    mode: 'transparent' | 'white' = bgDetectionMode,
+    tolerance: number = bgTolerance
+  ): Promise<ImageItem> => {
     return new Promise((resolve) => {
       const img = new Image();
       img.src = item.originalUrl;
@@ -229,14 +256,13 @@ export default function App() {
 
         try {
           const imageData = ctx.getImageData(0, 0, width, height);
-          const box = getOpaqueBoundingBox(imageData);
+          const box = getOpaqueBoundingBox(imageData, mode, tolerance);
 
           if (!box) {
-            // [에지케이스] 투명 픽셀만 존재하여 크랍이 무의미하거나 불가능한 경우
             resolve({
               ...item,
               status: 'error',
-              errorMessage: '실제 이미지 영역(불투명 픽셀)을 감지할 수 없습니다. 빈 투명 이미지입니다.'
+              errorMessage: '감지할 수 있는 개체가 존재하지 않거나 빈 흰색/투명 이미지입니다.'
             });
             return;
           }
@@ -249,10 +275,18 @@ export default function App() {
 
           const noMargin = topRemoved === 0 && bottomRemoved === 0 && leftRemoved === 0 && rightRemoved === 0;
 
-          // 크랍 완료 후 사용자가 정의한 패딩(여백) 수동 추가 연산 반영
-          // 왜 캔버스 크기를 새로 확장할까? 크랍 이후 디자이너가 안전 여백을 줘서 저장하고 싶어하기 때문입니다.
-          const croppedWidth = box.width + currentPadding.left + currentPadding.right;
-          const croppedHeight = box.height + currentPadding.top + currentPadding.bottom;
+          // 이너 크롭(음수 패딩) 및 아우터 패딩 동시 정밀 연산
+          // 음수 패딩 적용 시 소스(박스) 영역에서 해당 크기만큼 깎아냄
+          const srcLeft = box.left + (currentPadding.left < 0 ? -currentPadding.left : 0);
+          const srcTop = box.top + (currentPadding.top < 0 ? -currentPadding.top : 0);
+          
+          // 최소 1px 크기 보증
+          const srcWidth = Math.max(1, box.width - (currentPadding.left < 0 ? -currentPadding.left : 0) - (currentPadding.right < 0 ? -currentPadding.right : 0));
+          const srcHeight = Math.max(1, box.height - (currentPadding.top < 0 ? -currentPadding.top : 0) - (currentPadding.bottom < 0 ? -currentPadding.bottom : 0));
+
+          // 최종 생성할 캔버스 크기 계산 (음수 패딩을 반영하되 최소 1px 이상 보증)
+          const croppedWidth = Math.max(1, box.width + currentPadding.left + currentPadding.right);
+          const croppedHeight = Math.max(1, box.height + currentPadding.top + currentPadding.bottom);
 
           const outputCanvas = document.createElement('canvas');
           outputCanvas.width = croppedWidth;
@@ -271,11 +305,15 @@ export default function App() {
           // 출력 Canvas 배경 초기화 (투명 유지)
           outCtx.clearRect(0, 0, croppedWidth, croppedHeight);
           
+          // 목적지 캔버스에서의 포지션 결정 (양수 패딩만 해당 공간에 배치하고, 음수일 경우 0에 드로잉)
+          const destLeft = currentPadding.left > 0 ? currentPadding.left : 0;
+          const destTop = currentPadding.top > 0 ? currentPadding.top : 0;
+
           // 원본 이미지의 Bounding Box 영역을 새 크랍 Canvas의 패딩 위치에 드로잉
           outCtx.drawImage(
             img, 
-            box.left, box.top, box.width, box.height, // Source X, Y, W, H
-            currentPadding.left, currentPadding.top, box.width, box.height // Destination X, Y, W, H
+            srcLeft, srcTop, srcWidth, srcHeight, // Source X, Y, W, H
+            destLeft, destTop, srcWidth, srcHeight // Destination X, Y, W, H
           );
 
           // DataURL 형태로 Blob을 브라우저 메모리에 저장
@@ -310,7 +348,7 @@ export default function App() {
         });
       };
     });
-  }, []);
+  }, [bgDetectionMode, bgTolerance]);
 
   // ==========================================
   // 5. 이벤트 핸들러 (Event Handlers)
@@ -524,7 +562,7 @@ export default function App() {
   ) => {
     setImages(prev => {
       const idx = prev.findIndex(img => img.id === targetId);
-      if (idx === -1 || prev[idx].status !== 'done') return prev;
+      if (idx === -1) return prev; // status 검사 제거하여 원본 크랍되지 않은 이미지도 즉각 반응하도록 수정
 
       // 백그라운드 비동기로 크랍 재생성 시작
       processImageCrop(prev[idx], newPadding).then(updated => {
@@ -539,10 +577,44 @@ export default function App() {
       
       // 먼저 로딩을 살짝 표시하기 위해 processing 상태로 전환
       const clone = [...prev];
-      clone[idx] = { ...clone[idx], padding: newPadding };
+      clone[idx] = { ...clone[idx], padding: newPadding, status: 'processing' };
       return clone;
     });
   }, [processImageCrop]);
+
+  // 감지 옵션(모드, 허용오차) 변경 시 실시간으로 현재 선택된 이미지 재연산
+  const applyDetectionSettingsLive = useCallback(async (
+    mode: 'transparent' | 'white',
+    tolerance: number
+  ) => {
+    if (!selectedImageId) return;
+    
+    setImages(prev => {
+      const idx = prev.findIndex(img => img.id === selectedImageId);
+      if (idx === -1) return prev;
+
+      const targetItem = prev[idx];
+      const currentPadding = useIndividualPadding 
+        ? { ...paddingIndividual } 
+        : { top: paddingAll, bottom: paddingAll, left: paddingAll, right: paddingAll };
+
+      // 비동기로 새로운 설정 값 기반 크롭 계산 실행
+      processImageCrop(targetItem, currentPadding, mode, tolerance).then(updated => {
+        setImages(current => {
+          const innerIdx = current.findIndex(img => img.id === selectedImageId);
+          if (innerIdx === -1) return current;
+          const clone = [...current];
+          clone[innerIdx] = updated;
+          return clone;
+        });
+      });
+
+      // 계산 중 임시 상태
+      const clone = [...prev];
+      clone[idx] = { ...clone[idx], status: 'processing' };
+      return clone;
+    });
+  }, [selectedImageId, useIndividualPadding, paddingIndividual, paddingAll, processImageCrop]);
 
   // 패딩 설정 핸들러 (슬라이더 변화)
   const handlePaddingAllChange = (val: number) => {
@@ -1188,13 +1260,97 @@ export default function App() {
             )}
           </div>
 
+          {/* 4.5. 신규 추가: 여백 감지 분석 옵션 (투명 vs 흰색 배경 및 허용 오차 조절) */}
+          {currentImage && (
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-5 flex flex-col gap-4">
+              <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-2">
+                <h3 className="font-bold text-sm flex items-center gap-2 text-slate-700 dark:text-slate-200">
+                  <Sparkles className="w-4 h-4 text-primary" />
+                  여백 감지 분석 옵션 (흰색 배경 제거)
+                </h3>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
+                {/* 감지 모드 선택 토글 */}
+                <div className="flex flex-col gap-2">
+                  <label className="text-xs font-bold text-slate-500 dark:text-slate-400">여백 감지 기준 설정</label>
+                  <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-xl text-xs font-semibold">
+                    <button
+                      onClick={() => {
+                        setBgDetectionMode('transparent');
+                        applyDetectionSettingsLive('transparent', bgTolerance);
+                        addLog("여백 감지 모드가 [투명 배경 감지]로 설정되었습니다.", "info");
+                      }}
+                      className={`flex-1 py-2 text-center rounded-lg transition-all ${
+                        bgDetectionMode === 'transparent'
+                          ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
+                          : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
+                      }`}
+                    >
+                      투명 배경 감지 (기본)
+                    </button>
+                    <button
+                      onClick={() => {
+                        setBgDetectionMode('white');
+                        applyDetectionSettingsLive('white', bgTolerance);
+                        addLog("여백 감지 모드가 [흰색 배경 감지]로 설정되었습니다.", "info");
+                      }}
+                      className={`flex-1 py-2 text-center rounded-lg transition-all ${
+                        bgDetectionMode === 'white'
+                          ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-xs font-bold'
+                          : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
+                      }`}
+                    >
+                      흰색 배경 감지 및 크롭
+                    </button>
+                  </div>
+                </div>
+
+                {/* 흰색 배경 오차 허용 범위 (흰색 모드일때만 활성) */}
+                <div className="flex flex-col gap-2 transition-opacity">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold text-slate-500 dark:text-slate-400 flex items-center gap-1">
+                      감지 허용 오차 (밝기 민감도)
+                      <span className="text-[10px] text-slate-400 font-medium">(0 ~ 100)</span>
+                    </label>
+                    <span className="text-xs font-bold text-primary">{bgTolerance}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      disabled={bgDetectionMode !== 'white'}
+                      value={bgTolerance}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value);
+                        setBgTolerance(val);
+                        applyDetectionSettingsLive(bgDetectionMode, val);
+                      }}
+                      className="flex-1 accent-primary h-1 bg-slate-200 dark:bg-slate-800 rounded-lg disabled:opacity-30 disabled:cursor-not-allowed"
+                    />
+                    <span className="text-xs font-bold text-slate-400 dark:text-slate-500 w-8 text-right">
+                      {bgTolerance}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <p className="text-[10px] text-slate-400 dark:text-slate-500 leading-normal">
+                {bgDetectionMode === 'white' 
+                  ? '※ 흰색 배경 모드: 순수 투명색 뿐만 아니라 흰색에 가까운 픽셀(밝은 배경 및 미세 여백)을 감지해 자동 크롭합니다. 오차 값을 높이면 조금 더 어두운 연한 회색/그림자 영역까지 여백으로 간주해 잘라냅니다.'
+                  : '※ 투명 배경 모드: 일반 투명 PNG 요소 업로드 시 픽셀 투명도가 조금이라도 있는 개체의 경계를 완벽히 검출합니다.'
+                }
+              </p>
+            </div>
+          )}
+
           {/* F-10: 여백 패딩 수동 조절 (Padding Customization Controls) */}
           {currentImage && (
             <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-5 flex flex-col gap-4">
               <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80 pb-2">
                 <h3 className="font-bold text-sm flex items-center gap-2 text-slate-700 dark:text-slate-200">
                   <Sliders className="w-4 h-4 text-primary" />
-                  크랍 여백 패딩 수동 조절 (P2)
+                  크랍 여백 상세 피팅 및 이너 크롭 (P2)
                 </h3>
                 
                 {/* 일괄 / 개별 모드 변경 토글 */}
@@ -1231,14 +1387,14 @@ export default function App() {
               </div>
 
               {!useIndividualPadding ? (
-                /* 일괄 조절 슬라이더 */
+                /* 일괄 조절 슬라이더 - 이너 크롭을 위해 min을 -100으로 설정 */
                 <div className="flex items-center gap-4">
                   <label className="text-xs font-semibold text-slate-500 w-24 flex-shrink-0">
                     전체 패딩: {paddingAll}px
                   </label>
                   <input
                     type="range"
-                    min="0"
+                    min="-100"
                     max="200"
                     value={paddingAll}
                     onChange={(e) => handlePaddingAllChange(parseInt(e.target.value))}
@@ -1246,22 +1402,22 @@ export default function App() {
                   />
                   <input
                     type="number"
-                    min="0"
+                    min="-100"
                     max="200"
                     value={paddingAll}
-                    onChange={(e) => handlePaddingAllChange(Math.min(200, Math.max(0, parseInt(e.target.value) || 0)))}
+                    onChange={(e) => handlePaddingAllChange(Math.min(200, Math.max(-100, parseInt(e.target.value) || 0)))}
                     className="w-16 px-2 py-1 border border-slate-200 dark:border-slate-700 rounded-lg text-xs bg-slate-50 dark:bg-slate-800 text-center"
                   />
                 </div>
               ) : (
-                /* 개별 조절 슬라이더 그리드 */
+                /* 개별 조절 슬라이더 그리드 - 이너 크롭을 위해 min을 -100으로 설정 */
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {/* 상(Top) */}
                   <div className="flex items-center gap-3">
                     <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">상단 (Top)</label>
                     <input
                       type="range"
-                      min="0"
+                      min="-100"
                       max="200"
                       value={paddingIndividual.top}
                       onChange={(e) => handleIndividualPaddingChange('top', parseInt(e.target.value))}
@@ -1275,7 +1431,7 @@ export default function App() {
                     <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">하단 (Bottom)</label>
                     <input
                       type="range"
-                      min="0"
+                      min="-100"
                       max="200"
                       value={paddingIndividual.bottom}
                       onChange={(e) => handleIndividualPaddingChange('bottom', parseInt(e.target.value))}
@@ -1289,7 +1445,7 @@ export default function App() {
                     <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">좌측 (Left)</label>
                     <input
                       type="range"
-                      min="0"
+                      min="-100"
                       max="200"
                       value={paddingIndividual.left}
                       onChange={(e) => handleIndividualPaddingChange('left', parseInt(e.target.value))}
@@ -1303,7 +1459,7 @@ export default function App() {
                     <label className="text-xs font-semibold text-slate-500 w-16 flex-shrink-0">우측 (Right)</label>
                     <input
                       type="range"
-                      min="0"
+                      min="-100"
                       max="200"
                       value={paddingIndividual.right}
                       onChange={(e) => handleIndividualPaddingChange('right', parseInt(e.target.value))}
@@ -1313,8 +1469,8 @@ export default function App() {
                   </div>
                 </div>
               )}
-              <p className="text-[10px] text-slate-400 dark:text-slate-500">
-                ※ 여백 패딩을 조절하면 투명 여백이 제거된 크랍 이미지 외곽에 입력한 픽셀값 만큼의 투명 캔버스 공간이 실시간으로 덧붙여집니다.
+              <p className="text-[10px] text-slate-400 dark:text-slate-500 leading-normal">
+                ※ 수동 조절 팁: 패딩 값을 <strong>음수(-)</strong>로 설정하면, 감지된 요소의 테두리를 안쪽으로 파고들며 깎아내는 <strong>'이너 크롭(Inner Crop)'</strong>이 작동하여 잔여 배경색의 미세한 흔적을 완벽하게 없앨 수 있습니다.
               </p>
             </div>
           )}
